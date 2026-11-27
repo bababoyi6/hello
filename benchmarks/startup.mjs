@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { createHmac, hkdfSync, pbkdf2Sync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import '../scripts/node-sockets.mjs';
 import { FakeSocket, HELLO, independentCTR, transportFixture } from '../tests/fixtures.js';
 
 const ref = process.argv.find(arg => arg.startsWith('--against='))?.slice('--against='.length) ??

@@ -1,12 +1,12 @@
 import { connect } from 'cloudflare:sockets';
 import { expect, inject, it, vi } from 'vitest';
-import { createWorker, encodeFrame, visitFrames } from '../telegram_webproxy.js';
-import { createTCPEngine } from '../experiments/tcp.mjs';
+import { createTCPEngine, createUpstreamDial, createWorker, encodeFrame, visitFrames } from '../telegram_webproxy.js';
 import { ENV, ORIGIN, VECTOR, packet, transportFixture } from './fixtures.js';
 
 it('forwards a fragmented upload and drains the final native TCP bytes on EOF in workerd', async () => {
   const dial = vi.fn((_, options) => connect({ hostname: '127.0.0.1', port: inject('tcpOriginPort') }, options));
-  const worker = createWorker(createTCPEngine(dial), true);
+  const kws = vi.fn(() => { throw new Error('Unexpected KWS fallback'); });
+  const worker = createWorker(createUpstreamDial(createTCPEngine(dial), kws));
   const document = await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), ENV);
   const ticket = /"ticket":"([A-Za-z0-9_-]{43})"/.exec(await document.text())?.[1];
   expect(ticket).toBeTruthy();
@@ -37,6 +37,7 @@ it('forwards a fragmented upload and drains the final native TCP bytes on EOF in
     expect((await closed).code).toBe(1000);
     expect(closeFrame).toBe(true);
     expect(dial).toHaveBeenCalledOnce();
+    expect(kws).not.toHaveBeenCalled();
     const actual = fixture.fromWorker.update(Buffer.concat(received));
     const expected = Buffer.from(Array.from({ length: 131071 }, (_, i) => (i * 13 + 97) & 255));
     expect(actual.length).toBe(expected.length);

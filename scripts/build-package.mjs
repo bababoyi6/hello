@@ -10,7 +10,8 @@ const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 if (!/^const dashboardSeed = '';$/m.test(source) || !/^  const value = env\.p;$/m.test(source)) {
   throw new Error('Build requires the public source with the p Secret');
 }
-if (/^\s*import\b/m.test(source) || !source.includes('export default')) {
+const sourceWithoutBuiltin = source.replace(/^import \{ connect \} from 'cloudflare:sockets';$/m, '');
+if (/^\s*import\b/m.test(sourceWithoutBuiltin) || !source.includes('export default')) {
   throw new Error('Expected a standalone Module Worker');
 }
 

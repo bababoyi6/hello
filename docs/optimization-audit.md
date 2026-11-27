@@ -1,6 +1,6 @@
 # Telegram WEB 代理源码审计与优化
 
-审计基线为 `hello` 的 `cc6854dac1e368c9ad1b3467bcc7cee276c893c7`。验收以 `p`、自定义域名和单个 JS 为部署条件，保留 `/admin`、原代理链接格式、逐流 WebSocket 和官方 Telegram KWS 上游。
+审计基线为 `hello` 的 `cc6854dac1e368c9ad1b3467bcc7cee276c893c7`。部署仍只需 `p`、自定义域名和单个 JS。Worker 保留 `/admin`、原代理链接格式和逐流 WebSocket。上游在普通 DC 上优先直连 TCP，媒体及 TCP 建连失败时使用官方 KWS。
 
 ## 源码对照
 
@@ -13,9 +13,9 @@
 
 三个审读版本的许可证均为 MIT。本次从参考实现借鉴设计和测试思路，改动基于本项目代码独立实现。仓库继续按 [GPL-3.0](../LICENSE) 分发。
 
-## CTR 与 KWS
+## CTR 与上游封包
 
-Obfuscated2 的 64 字节客户端头将双向材料从中间 48 字节按正反方向分别取出。对代理链路，相应密钥材料与代理密钥一起做 SHA-256。客户端上传流在处理头之后从偏移 64 继续，下行从偏移 0 开始。当前 Worker 向 KWS 建立一套独立握手，使用随机头，分别得到两套上下行 CTR 状态。上传以完整 MTProto transport 包写入 KWS WebSocket，下行按字节流处理，分片只推进实际经过的 CTR 字节。 [Telegram transport obfuscation](https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation) · [Telegram transport](https://core.telegram.org/mtproto/transports) · [NIST SP 800-38A](https://csrc.nist.gov/pubs/sp/800/38/a/final)
+Obfuscated2 的 64 字节客户端头将双向材料从中间 48 字节按正反方向分别取出。对代理链路，相应密钥材料与代理密钥一起做 SHA-256。客户端上传流在处理头之后从偏移 64 继续，下行从偏移 0 开始。Worker 针对选定的上游生成独立随机头。KWS 头携带有符号 DC，TCP 头的对应字段填零。下行按字节流处理，分片只推进实际经过的 CTR 字节。 [Telegram transport obfuscation](https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation) · [Telegram transport](https://core.telegram.org/mtproto/transports) · [NIST SP 800-38A](https://csrc.nist.gov/pubs/sp/800/38/a/final)
 
 TWP 和 ProxyGosha 直通方案把派生后的客户端下行密钥和 IV 逆向写入上游头部的可见字节，通过 TCP 上游生成客户端可直接消费的下行密文。这个等式要求两侧从同一个计数器位置处理完全相同的字节序列，也要求同一密钥和计数器序列只服务同一个逻辑密文字节流。向另一个端点发送相同下行材料、重放头部，或把相同的 CTR 序列用于不同明文，都可能造成密钥流复用。上游 TLS 会保护链路传输，握手字段仍向上游终止点披露该客户端的下行密钥材料。
 
@@ -25,6 +25,7 @@ KWS 需另外证明 `binary` 子协议、各 transport mode、媒体 DC 和断�
 
 | 优先级 | 问题与位置 | 实现和验证 |
 | --- | --- | --- |
+| 高 | `createUpstreamDial`、`Lane.startStream` | 普通 DC 优先 TCP，单次握手等待 750 毫秒。TCP 无法建连时，同一 Lane 走 KWS。每个 DC 冷却 15 秒，避免新连接连续等待坏线路。媒体连接沿用 KWS。TCP 开通后断开或写入失败时，关闭原 Lane，让客户端按协议重建。此次连接不重放到备用端点。 |
 | 高 | `Lane.enqueueDown`、`pumpDown` 和上游关闭 | KWS 以 `1000` 关闭时，在仍有下行数据的情况下，按额度发送已接收的数据，再关闭 Lane。异常断开、撤销和过期即时收尾。尾包等待有期限，关闭后停止接收新上传数据。测试覆盖尾包顺序、阻塞期限、并行 Lane 继续工作和预算归零。 |
 | 高 | `writeNative`、`reconcileNative`、`drain`、Bridge 发送队列 | 检查读数为非负安全整数，并处理读取抛错。原生读数从连接开始即不可用时使用应用层额度和上限。已经记账的原生队列失去读数时关闭该 Lane。发送有进展时及时继续，无进展时降低轮询频率。测试覆盖缺失值、`NaN`、慢客户端、时间上限和定时器取消。 |
 | 高 | `scheduleNativeCheck` 与半开连接 | 只要原生发送队列仍有已记账数据，就分别记录客户端和上游的进展。即使队列小于拥塞阈值，一侧持续 30 秒无进展也会释放 Lane 和缓冲。另一侧有进展不会掩盖该停滞。空队列停止轮询，正常空闲连接保持在线。 |
@@ -33,7 +34,7 @@ KWS 需另外证明 `binary` 子协议、各 transport mode、媒体 DC 和断�
 | 中 | `createCTR`、`pumpDown` | 减少非对齐下载中的 JS 中间复制，保留 WebCrypto AES-CTR、块内尾部和 128 位进位检查。同步推入 KWS 事件回调，使 workerd 的事件处理无需接收一个未使用的 Promise。 |
 | 中 | `connectKWS`、`UpstreamRouter`、`portalDiagnostics` | 每个 DC 的普通及媒体线路记录成功率、P95、备用尝试、取消和有限错误类别，区分 Bridge 签发、载体升级、上游握手和实际转发。记录应用层缓冲峰值及关闭原因。所有数据来自已有连接，手动 HTTPS 计时按钮仍按用户操作触发。 |
 
-生产路径继续走固定的官方 KWS 主备域名，拒绝跟随重定向。默认单次拨号 3 秒，主路迟滞 900 毫秒后可开启备用，最多两个候选和每实例八个并发备用竞速。较晚返回的 Upgrade 会释放，备用路径独立冷却。Bridge 保留快速票据，并在需要续期或退化到旧载体握手时，对短暂的 HTTP 故障按总期限重试，尊重可用的 `Retry-After`。网络切换由客户端按 Lane 恢复，Worker 不重放业务数据。连接空闲时不加主动心跳；等待头部、部分上传包、发送额度、回压和父会话到期均有边界。TCP 代码只用于现有兼容测试和本地对照，默认 Worker 入口使用 KWS。
+TCP 只拨号到 TDLib 的普通 DC 引导地址。Worker 使用内置模块 `cloudflare:sockets`，部署仍是单个 JS。KWS 保留固定官方主备域名，拒绝跟随重定向。默认单次拨号 3 秒，主路迟滞 900 毫秒后可开启备用，最多两个候选和每实例八个并发备用竞速。较晚返回的 Upgrade 会释放，备用路径独立冷却。Bridge 保留快速票据，短暂 HTTP 故障按总期限重试并尊重可用的 `Retry-After`。网络切换由客户端按 Lane 恢复。连接空闲时保持被动，头部、部分上传包、发送额度、回压和父会话到期均有边界。 [TDLib 引导地址](https://github.com/tdlib/td/blob/master/td/telegram/net/ConnectionCreator.cpp) · [Workers TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 
 `WINDOW` 为 4 MiB，`DOWN_FRAME` 为 64 KiB，`CRYPT_CHUNK` 为 512 KiB，`SOCKET_BUFFER` 目标为 2 MiB，`PACK` 和 `BULK_PACK` 分别为 32 KiB 和 256 KiB。合包只消化已排队数据，保留小消息快路径。应用预算按 Lane 32 MiB、父会话 36 MiB、实例 40 MiB 分层记账。可读的原生排队数据也入账。缺失原生读数时，应用额度能约束自身数据，无法量到已交给 `send()` 的运行时缓冲。原生内存、GC 和其他对象也由运行时计费。固定上限和基于发送进度的轮询已经覆盖本地慢客户端场景；扩大窗口、自动测速档位和正常流量额外控制请求没有采用。
 
@@ -42,11 +43,11 @@ KWS 需另外证明 `binary` 子协议、各 transport mode、媒体 DC 和断�
 - 单密钥部署用绑定域名的 PBKDF2-SHA-256（16,000 次）派生原始材料，再用 HKDF 域分隔产生 128 位代理密钥和载体签名密钥。Bridge capability 为带域名上下文的 HMAC，载体票据另绑定用途、域名、有效期和会话 ID。Fast/Bootstrap 票据为 90/120 秒，常规票据可续到 5 分钟，续期授权最长 12 小时。代理链接或 Bridge capability 泄露后，弱 `p` 可被离线猜测。修改默认派生会更换现有链接，因此保留既有参数，部署文档要求独立随机 `p`。
 - 后台 Cookie 使用 `Secure`、`HttpOnly`、`SameSite=Strict` 和 `/admin` 路径，登录与退出检查 Origin。载体允许缺少 Origin 的兼容请求，带 Origin 时要求匹配，并继续验证凭据。JS 使用 nonce CSP、`no-store`、`no-referrer`，Bridge 会在加载后清除浏览器地址查询参数。原有客户端首个请求必须携带查询参数 `bridge`，它仍可能进入平台访问日志或调用日志；启用日志时须保护查询字符串及会话相关头部。诊断只含固定分类和聚合计数。 [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
 - 客户端帧校验类型、流 ID、长度、额度和会话期限。登录限流为同实例每域名/IP 每分钟 8 次、总计 120 次，Lane 为每父会话 64、每实例 128。已用 Lane ID 和 DELETE 撤销记录属于实例内存，每组最多 4,096 个 ID、每实例最多 16,384 个。票据跨实例验签，但实例之间不共享撤销、去重和限流记录。现有链接可签发新的 Bridge 会话；密码和链接应视为凭据。
-- 按审计日的 Workers Free 文档，免费账户每日 100,000 个传入请求，CPU 上限 10 ms，内存上限 128 MB（每 isolate），每次调用 50 个子请求、最多 6 个同时等待响应头的外连。每次初始 WebSocket Upgrade 计入请求，后续消息不各算一条请求。正常首连走一次 Bridge、每 Lane 一次 Upgrade 和一次 KWS 拨号。边缘运行时的 CPU、原生缓冲、重启以及 WebSocket 生命周期仍受平台管理。 [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/) · [Workers Pricing](https://developers.cloudflare.com/workers/platform/pricing/) · [Workers WebSocket API](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
+- 按审计日的 Workers Free 文档，免费账户每日 100,000 个传入请求，CPU 上限 10 ms，内存上限 128 MB（每 isolate），每次调用 50 个子请求、最多 6 个正在建立的外连。每次初始 WebSocket Upgrade 计入请求，后续消息不各算一条请求。正常首连走一次 Bridge，每 Lane 一次客户端 Upgrade 和一次上游拨号。边缘运行时的 CPU、原生缓冲、重启以及 WebSocket 生命周期仍受平台管理。 [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/) · [Workers Pricing](https://developers.cloudflare.com/workers/platform/pricing/) · [Workers WebSocket API](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 
 ## 验证与复现
 
-基线通过 81 项 Node 测试和 8 项本地 workerd 测试。改版通过 99 项 Node 测试和 10 项本地 workerd 测试。用例覆盖标准 AES-CTR 测试向量、任意分片和计数器进位，载体与 MTProto 帧、损坏输入、鉴权和原代理密钥向量，双向传输、最大包、并行 Lane、回压与预算、主备、迟到响应、超时、过期以及清理。workerd 验证包含只提供 `p` 的打包文件、模拟 KWS 与原生 WebSocket、客户端或上游先关闭，以及原生 TCP 回环连接上的分片双向传输和 EOF。CI 使用固定依赖，并验证两条传输路径的批量数据完整性。
+基线通过 81 项 Node 测试和 8 项本地 workerd 测试。改版通过 103 项 Node 测试和 10 项本地 workerd 测试。用例覆盖标准 AES-CTR 测试向量、任意分片和计数器进位，载体与 MTProto 帧、损坏输入、鉴权和原代理密钥向量，双向传输、最大包、并行 Lane、回压与预算、主备、迟到响应、超时、过期以及清理。TCP 路由用例继续验证超时后的同 Lane 回退、逐 DC 冷却、取消拨号、写入后只关闭当前 Lane，以及媒体仍走 KWS。workerd 验证包含只提供 `p` 的打包文件、模拟 KWS 与原生 WebSocket，以及原生 TCP 回环连接上的分片双向传输和 EOF。CI 使用固定依赖，并验证两条路径的批量数据完整性。
 
 ```sh
 npm ci
@@ -105,7 +106,18 @@ node benchmarks/startup.mjs --against=cc6854dac1e368c9ad1b3467bcc7cee276c893c7
 | DC 2，第 2 次 | 285 | 740 | 829 |
 | DC 5 | 443 | 1,270 | 1,297 |
 
-**生产继续使用 KWS。** TCP 在实测路径上的普通 DC 初始响应更快，KWS 在多数本地传输负载中有更好的吞吐和批次 P95。ORD 的四个样本没有覆盖亚洲边缘、长期会话或登录后媒体传输，目前也缺少 TCP 媒体和主备路由同等覆盖。TCP 实验留在自动化测试与基准里。生产入口不加额外拨号、定时探测或传输切换。 [Telegram 初始握手](https://core.telegram.org/mtproto/samples-auth_key) · [Cloudflare Workers Playground](https://developers.cloudflare.com/workers/playground/)
+**生产采用普通 DC 的 TCP 优先策略。** TCP 在实测路径上缩短普通 DC 的初始响应时间，KWS 仍承担媒体与备用线路。KWS 在多数模拟传输负载中有更好的吞吐和批次 P95，这个差异仍适用。ORD 的样本只测匿名握手。生产入口按真实 Lane 建连，无周期探测。 [Telegram 初始握手](https://core.telegram.org/mtproto/samples-auth_key) · [Cloudflare Workers Playground](https://developers.cloudflare.com/workers/playground/)
+
+TCP 优先实现完成后，另用本机 workerd 加载完整 Worker，以合成的 `p` 完成 Bridge 和 Lane 鉴权，再向官方上游发送未认证 `req_pq_multi`。诊断记录了 5 条 TCP 连接和 1 条媒体 KWS，均收到 nonce 匹配的 `resPQ`。单次受当前本机公网路径影响。
+
+| 线路 | MTProto transport | 从 Lane OPEN 到响应 |
+| --- | --- | ---: |
+| DC 1 TCP | abridged | 2,261 ms |
+| DC 2 TCP | padded intermediate | 1,007 ms |
+| DC 3 TCP | padded intermediate | 939 ms |
+| DC 4 TCP | intermediate | 996 ms |
+| DC 5 TCP | padded intermediate | 1,318 ms |
+| DC 2 媒体 KWS | padded intermediate | 4,255 ms |
 
 ### 实机验收范围
 

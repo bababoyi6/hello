@@ -3,8 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { encodeFrame, visitFrames } from '../telegram_webproxy.js';
-import { createTCPEngine } from '../experiments/tcp.mjs';
+import '../scripts/node-sockets.mjs';
 import { FakeSocket, independentCTR, packet, syntheticGroup, transportFixture, until, windowFrame } from '../tests/fixtures.js';
 
 const ORIGINAL = 'e565c57ff58656fd544755f67e1c266148c0b88f';
@@ -28,7 +27,9 @@ function moduleSource(source) {
   const prefix = countCopies ? 'const Uint8Array = globalThis.MeasuredWorkerBytes;\n' : '';
   return 'data:text/javascript;base64,' + Buffer.from(prefix + source).toString('base64');
 }
-const { Lane } = await import(countCopies ? moduleSource(readFileSync(candidateURL, 'utf8')) : candidateURL.href);
+const { Lane, createTCPEngine, encodeFrame, visitFrames } = await import(
+  countCopies ? moduleSource(readFileSync(candidateURL, 'utf8')) : candidateURL.href
+);
 const verifyPayload = process.argv.includes('--verify');
 const compare = process.argv.find(arg => arg.startsWith('--against='));
 let baseline = null;
