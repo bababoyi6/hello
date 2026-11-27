@@ -1,0 +1,21 @@
+{
+  "name": "cf-workers-tgproxy",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --config vitest.config.js",
+    "test:runtime": "npm run build:pages && node scripts/verify-package.mjs && npm run build:workers && node scripts/verify-package.mjs --workers && vitest run --config vitest.workers.config.js",
+    "build:pages": "node scripts/build-package.mjs",
+    "build:workers": "node scripts/build-package.mjs --workers",
+    "bench": "node --expose-gc benchmarks/transport.mjs",
+    "bench:startup": "node benchmarks/startup.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.8.5",
+    "vitest": "4.1.12"
+  }
+}

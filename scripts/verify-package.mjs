@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { crc32 } from 'node:zlib';
+
+const workers = process.argv.includes('--workers');
+const filename = workers ? 'telegram_webproxy.js' : '_worker.js';
+const nameLength = Buffer.byteLength(filename);
+const archive = workers ? 'Workers.zip' : 'Pages.zip';
+const output = new URL(workers ? '../dist/workers/' : '../dist/', import.meta.url);
+const zip = readFileSync(new URL(archive, output));
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+let checksums = digest(zip) + '  ' + archive + '\n';
+
+const end = zip.subarray(-22);
+assert.equal(end.readUInt32LE(0), 0x06054b50);
+assert.equal(end.readUInt16LE(8), 1);
+assert.equal(end.readUInt16LE(10), 1);
+assert.equal(end.readUInt16LE(20), 0);
+const centralOffset = end.readUInt32LE(16);
+const central = zip.subarray(centralOffset, -22);
+assert.equal(central.length, end.readUInt32LE(12));
+assert.equal(central.readUInt32LE(0), 0x02014b50);
+assert.equal(central.readUInt16LE(10), 0);
+assert.equal(central.readUInt16LE(28), nameLength);
+assert.equal(central.readUInt16LE(30), 0);
+assert.equal(central.readUInt16LE(32), 0);
+assert.equal(central.readUInt32LE(42), 0);
+assert.equal(central.subarray(46).toString(), filename);
+assert.equal(zip.readUInt32LE(0), 0x04034b50);
+assert.equal(zip.readUInt16LE(8), 0);
+assert.equal(zip.readUInt16LE(26), nameLength);
+assert.equal(zip.readUInt16LE(28), 0);
+assert.equal(zip.subarray(30, 30 + nameLength).toString(), filename);
+const file = zip.subarray(30 + nameLength, centralOffset);
+assert.equal(file.length, zip.readUInt32LE(18));
+assert.equal(file.length, zip.readUInt32LE(22));
+assert.equal(file.length, central.readUInt32LE(20));
+assert.equal(file.length, central.readUInt32LE(24));
+assert.equal(crc32(file), zip.readUInt32LE(14));
+assert.equal(crc32(file), central.readUInt32LE(16));
+const publicSource = readFileSync(new URL('../telegram_webproxy.js', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
+assert.deepEqual(file, Buffer.from(publicSource));
+if (workers) {
+  assert.deepEqual(readFileSync(new URL(filename, output)), file);
+  checksums += digest(file) + '  ' + filename + '\n';
+}
+assert.equal(readFileSync(new URL('SHA256SUMS.txt', output), 'utf8'), checksums);
+const extracted = new URL('verified/', output);
+mkdirSync(extracted, { recursive: true });
+writeFileSync(new URL(filename, extracted), file);
+console.log('Verified ' + archive + ', ' + filename + ' and SHA-256');

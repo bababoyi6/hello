@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { connect } from 'cloudflare:sockets';
 // Derived from ToiCF/CF-Workers-TGProxy, e565c57ff58656fd544755f67e1c266148c0b88f, with modifications through 2026-11-20.
 const KiB = 1024;
 const MiB = 1024 * KiB;
@@ -20,6 +21,7 @@ const BOOT_LIFETIME = 120, TICKET_LIFETIME = 300, GRANT_LIFETIME = 12 * 3600;
 const FAST_TICKET_LIFETIME = 90, PORTAL_LIFETIME = 30 * 60;
 const MAX_SID = 0xffffff;
 const SESSION_EXPIRED_CLOSE = 4001;
+const ADMIN_BODY_LIMIT = 1024;
 const EMPTY = new Uint8Array(0);
 const textEncoder = new TextEncoder();
 const subtle = crypto.subtle;
@@ -269,8 +271,7 @@ async function readExactBody(request, expected) {
 }
 
 async function readBoundedBody(request, limit) {
-  const length = request.headers.get('Content-Length');
-  if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) return null;
+  if (!lengthAllowed(request.headers, limit)) return null;
   if (!request.body) return EMPTY;
   const reader = request.body.getReader();
   const body = new Uint8Array(limit);
@@ -292,6 +293,11 @@ async function readBoundedBody(request, limit) {
   }
 }
 
+function lengthAllowed(headers, limit) {
+  const length = headers.get('Content-Length');
+  return length === null || (/^\d+$/.test(length) && Number(length) <= limit);
+}
+
 class LaneFault extends Error {
   constructor(kind) {
     super(kind);
@@ -304,19 +310,22 @@ class LaneFault extends Error {
 const groups = new Map();
 const counters = Object.create(null);
 const timingBounds = [10, 25, 50, 100, 200, 400, 800, 1600, 3000, 6000];
+const newHistogram = () => new Uint32Array(timingBounds.length + 1);
 const timings = {
-  bridgeConfig: new Uint32Array(timingBounds.length + 1),
-  bridgePage: new Uint32Array(timingBounds.length + 1),
-  client: new Uint32Array(timingBounds.length + 1),
-  upgrade: new Uint32Array(timingBounds.length + 1),
-  kws: new Uint32Array(timingBounds.length + 1),
-  firstUpstream: new Uint32Array(timingBounds.length + 1),
-  firstForwarded: new Uint32Array(timingBounds.length + 1),
-  downCredit: new Uint32Array(timingBounds.length + 1),
-  downSocket: new Uint32Array(timingBounds.length + 1),
+  bridgeConfig: newHistogram(), bridgePage: newHistogram(), client: newHistogram(), upgrade: newHistogram(),
+  tcp: newHistogram(), kws: newHistogram(), firstUpstream: newHistogram(), firstForwarded: newHistogram(),
+  downCredit: newHistogram(), downSocket: newHistogram(),
 };
+const tcpStats = Array.from({ length: 5 }, () => ({
+  connected: 0, failed: 0, timeout: 0, cooldown: 0, firstResponseFailures: 0, timing: newHistogram(),
+}));
+const upstreamStats = Array.from({ length: 10 }, () => ({
+  connected: 0, failed: 0, cancelled: 0, retries: 0, timeout: 0, network: 0, http: 0, protocol: 0,
+  timing: newHistogram(),
+}));
+const dcIndex = ({ dc, media }) => (dc - 1) * 2 + Number(media);
 let upstreamBytes = 0, forwardedBytes = 0;
-let activeLanes = 0, queuedBytes = 0, recordedIds = 0, nextSweep = 0;
+let activeLanes = 0, queuedBytes = 0, peakQueuedBytes = 0, recordedIds = 0, nextSweep = 0;
 
 function getGroup(key, expires) {
   const time = now();
@@ -347,6 +356,7 @@ function laneBudget(group) {
       total += size;
       group.bytes += size;
       queuedBytes += size;
+      if (queuedBytes > peakQueuedBytes) peakQueuedBytes = queuedBytes;
     },
     release(size) {
       total -= size;
@@ -356,8 +366,12 @@ function laneBudget(group) {
   };
 }
 
+function increment(object, name) {
+  object[name] = Math.min((object[name] ?? 0) + 1, 0x7fffffff);
+}
+
 function count(kind) {
-  if (kind !== 'normal') counters[kind] = Math.min((counters[kind] ?? 0) + 1, 0x7fffffff);
+  if (kind !== 'normal') increment(counters, kind);
 }
 
 function clientRtt(request) {
@@ -381,11 +395,11 @@ function timingSummary(histogram) {
   return samples + ' 次，P95 ' + bound + ' ms';
 }
 
-function createWorker(dial = dialKWS, directTCP = false) {
+function createWorker(dial = dialUpstream) {
   return {
     async fetch(request, env) {
       try {
-        return await route(request, env, dial, directTCP);
+        return await route(request, env, dial);
       } catch {
         count('request');
         return unavailable();
@@ -393,8 +407,6 @@ function createWorker(dial = dialKWS, directTCP = false) {
     },
   };
 }
-
-export default createWorker();
 
 
 function sessionID(bootstrap) {
@@ -456,9 +468,10 @@ async function routePortal(request, env, url, host, password) {
   if (pathname !== adminPath) return unavailable();
   if (method === 'POST' && !search) {
     if (headers.get('Origin') !== url.origin ||
-        headers.get('Content-Type')?.split(';', 1)[0] !== 'application/x-www-form-urlencoded') return unavailable();
+        headers.get('Content-Type')?.split(';', 1)[0] !== 'application/x-www-form-urlencoded' ||
+        !lengthAllowed(headers, ADMIN_BODY_LIMIT)) return unavailable();
     if (!allowLogin(request, host)) return loginResponse(method, '尝试次数过多，请稍后再试。', 429);
-    const body = await readBoundedBody(request, 1024);
+    const body = await readBoundedBody(request, ADMIN_BODY_LIMIT);
     const submitted = body && new URLSearchParams(new TextDecoder().decode(body)).getAll('password');
     const value = submitted?.length === 1 && textEncoder.encode(submitted[0]);
     if (!value || value.length > 256 ||
@@ -480,16 +493,18 @@ async function routePortal(request, env, url, host, password) {
   const cookies = (headers.get('Cookie') ?? '').split(';').map(value => value.trim())
     .filter(value => value.startsWith(portalCookie + '='));
   const token = cookies.length === 1 && decodeToken(cookies[0].slice(portalCookie.length + 1));
-  if (!token || view(token).getUint32(0) <= now()) return probe ? unavailable() : loginResponse(method);
+  const expiry = token ? view(token).getUint32(0) : 0;
+  const clock = now();
+  if (expiry <= clock || expiry > clock + PORTAL_LIFETIME + 5) return probe ? unavailable() : loginResponse(method);
   const cfg = await configuration(env, host, false, password);
-  if (!cfg || !equalBytes(token.subarray(16), await portalSessionMAC(cfg, host, password, token.subarray(0, 16)))) {
+  if (!cfg || !equalBytes(token.subarray(16), await portalSessionMAC(cfg, host, password, token.subarray(0, 16))) || expiry <= now()) {
     return probe ? unavailable() : loginResponse(method);
   }
   if (probe) return new Response(null, { status: 204, headers: noStore });
   return portalResponse(host, cfg.secret, request, Boolean(search));
 }
 
-async function route(request, env, dial, directTCP) {
+async function route(request, env, dial) {
   const url = new URL(request.url);
   const host = canonicalHost(url);
   if (!host) return unavailable();
@@ -545,7 +560,7 @@ async function route(request, env, dial, directTCP) {
   }
   const auth = await authenticateToken(cfg, host, purpose, claims);
   if (!auth || now() >= auth.expires) return unavailable();
-  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started, dial, directTCP);
+  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started, dial);
   const deadline = view(auth.id).getUint32(0);
   const key = groupKey(host, auth.id);
   if (method === 'DELETE') {
@@ -589,7 +604,7 @@ function parseLaneProtocol(headers) {
   return { protocol, token: match[1], sid: Number(match[2]) };
 }
 
-function upgradeLane(request, cfg, host, { protocol, sid }, auth, started, dial, directTCP) {
+function upgradeLane(request, cfg, host, { protocol, sid }, auth, started, dial) {
   const group = getGroup(groupKey(host, auth.id), view(auth.id).getUint32(0));
   if (group?.deleted || group?.used.has(sid)) return unavailable();
   if (!group || group.used.size >= 4096 || group.active >= 64 ||
@@ -603,7 +618,7 @@ function upgradeLane(request, cfg, host, { protocol, sid }, auth, started, dial,
   const release = () => { group.active--; activeLanes--; };
   let lane;
   try {
-    lane = new Lane(server, sid, cfg.proxyKey, group, dial, { release, directTCP });
+    lane = new Lane(server, sid, cfg.proxyKey, group, dial, { release });
     lane.attach();
     const response = new Response(null, { status: 101, webSocket: client, headers: {
       ...noStore, 'Sec-WebSocket-Protocol': protocol, 'Sec-WebSocket-Extensions': '',
@@ -642,7 +657,7 @@ function createCTR(rawKey, counter) {
   const tail = new Uint8Array(16);
   let remaining = 0, busy = false, exhausted = false;
 
-  return async function crypt(value) {
+  return async function crypt(value, reusePadding = false) {
     if (busy) throw new Error('concurrent CTR use');
     const bytes = binary(value);
     if (!bytes.byteLength) return EMPTY;
@@ -668,8 +683,17 @@ function createCTR(rawKey, counter) {
       }
       let input = bytes;
       if (padded !== bytes.length) {
-        input = new Uint8Array(padded);
-        input.set(bytes, skip);
+        if (reusePadding && bytes.byteOffset === skip && bytes.buffer.byteLength === padded) {
+          // Only the downlink's freshly decrypted output takes this path.
+          // Its payload is already aligned for the second cipher. Bytes
+          // beyond the view are scratch, and the tail must start at zero.
+          input = new Uint8Array(bytes.buffer);
+          input.fill(0, 0, skip);
+          input.fill(0, end);
+        } else {
+          input = new Uint8Array(padded);
+          input.set(bytes, skip);
+        }
       }
       const result = new Uint8Array(await subtle.encrypt(
         { name: 'AES-CTR', counter: start, length: 128 }, await key, input,
@@ -699,7 +723,7 @@ function readHead(head) {
   return { mode, dc: Math.abs(dc), media: dc < 0 };
 }
 
-function makeHead({ mode, dc, media }, directTCP = false) {
+function makeHead({ mode, dc, media }) {
   const head = new Uint8Array(64);
   const header = view(head);
   const forbidden = [0x48454144, 0x504f5354, 0x47455420, 0x4f505449, 0xeeeeeeee, 0xdddddddd, 0x16030102];
@@ -707,7 +731,7 @@ function makeHead({ mode, dc, media }, directTCP = false) {
     crypto.getRandomValues(head);
   } while (head[0] === 0xef || forbidden.includes(header.getUint32(0)) || !header.getUint32(4));
   head.fill(mode, 56, 60);
-  if (!directTCP) header.setInt16(60, media ? -dc : dc, true);
+  header.setInt16(60, media ? -dc : dc, true);
   return head;
 }
 
@@ -733,6 +757,7 @@ function packetSize(bytes, offset, mode) {
 class PacketAssembly {
   prefix = new Uint8Array(4);
   size = 0;
+  length = 0;
   packet = null;
   filled = 0;
 
@@ -741,38 +766,52 @@ class PacketAssembly {
     this.budget = budget;
   }
 
-  get pending() { return this.packet !== null || this.size > 0; }
+  get pending() { return this.length > 0 || this.size > 0; }
 
   add(bytes, offset) {
-    if (!this.packet) {
+    if (!this.length) {
       const width = this.mode === 0xef && ((this.size ? this.prefix[0] : bytes[offset]) & 127) !== 127 ? 1 : 4;
       const take = Math.min(width - this.size, bytes.length - offset);
       this.prefix.set(bytes.subarray(offset, offset + take), this.size);
       this.size += take;
       offset += take;
       if (this.size < width) return { offset, packet: null };
-      const length = packetSize(this.prefix, 0, this.mode);
-      this.budget.hold(length);
-      try { this.packet = new Uint8Array(length); }
-      catch (error) { this.budget.release(length); throw error; }
-      this.packet.set(this.prefix.subarray(0, width));
+      this.length = packetSize(this.prefix, 0, this.mode);
       this.filled = width;
       this.size = 0;
     }
-    const take = Math.min(this.packet.length - this.filled, bytes.length - offset);
+    const take = Math.min(this.length - this.filled, bytes.length - offset);
+    const required = this.filled + take;
+    const previous = this.packet?.length ?? 0;
+    if (required > previous) {
+      // Grow with received bytes, so a four-byte length cannot reserve an
+      // entire maximum-size packet. Charge both buffers during a resize.
+      const capacity = Math.min(this.length, Math.max(required, 64 * KiB, 2 * previous));
+      this.budget.hold(capacity);
+      try {
+        const next = new Uint8Array(capacity);
+        next.set(this.packet ? this.packet.subarray(0, this.filled) : this.prefix.subarray(0, this.filled));
+        this.packet = next;
+      } catch (error) {
+        this.budget.release(capacity);
+        throw error;
+      }
+      if (previous) this.budget.release(previous);
+    }
     this.packet.set(bytes.subarray(offset, offset + take), this.filled);
     this.filled += take;
     offset += take;
-    if (this.filled < this.packet.length) return { offset, packet: null };
+    if (this.filled < this.length) return { offset, packet: null };
     const packet = this.packet;
     this.packet = null;
+    this.length = 0;
     return { offset, packet };
   }
 
   clear() {
     if (this.packet) this.budget.release(this.packet.length);
     this.packet = null;
-    this.size = 0;
+    this.size = this.length = 0;
   }
 }
 
@@ -849,8 +888,8 @@ class UpstreamRouter {
     this.clock = clock;
   }
 
-  path({ dc, media }, candidate) {
-    return this.paths[(dc - 1) * 2 + Number(media)][candidate];
+  path(info, candidate) {
+    return this.paths[dcIndex(info)][candidate];
   }
 
   plan(info) {
@@ -888,6 +927,120 @@ function dialKWS(info, signal) {
   return connectKWS(info, signal, fetch, 3000, 900, kwsRouter);
 }
 
+// Regular IPv4 bootstrap DCs from TDLib's ConnectionCreator.cpp. Media
+// destinations have separate options and must keep using the KWS route.
+const telegramTCP = Object.freeze([
+  '149.154.175.50', '149.154.167.51', '149.154.175.100', '149.154.167.91', '149.154.171.5',
+]);
+const TCP_DIAL_MS = 750;
+const TCP_COOLDOWN_MS = 15000;
+
+function closeTCP(socket) {
+  try { void socket.close().catch(() => {}); } catch {}
+}
+
+class TCPPeer {
+  constructor(socket) {
+    this.socket = socket;
+    this.reader = socket.readable.getReader({ mode: 'byob' });
+    try { this.writer = socket.writable.getWriter(); }
+    catch (error) {
+      this.reader.releaseLock();
+      throw error;
+    }
+  }
+
+  read(size) {
+    return this.reader.read(new Uint8Array(size));
+  }
+
+  write(bytes) {
+    return this.writer.write(bytes);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    closeTCP(this.socket);
+    try { this.reader.releaseLock(); }
+    finally { this.writer.releaseLock(); }
+  }
+}
+
+function createTCPEngine(open, timeout = TCP_DIAL_MS) {
+  return async ({ dc, media }, signal) => {
+    if (!Number.isInteger(dc) || dc < 1 || dc > telegramTCP.length || media !== false) {
+      throw new LaneFault('obfuscation');
+    }
+    if (signal.aborted) throw new LaneFault('tcp-cancelled');
+    const socket = open({ hostname: telegramTCP[dc - 1], port: 443 }, { secureTransport: 'off', allowHalfOpen: false });
+    void socket.closed.catch(() => {});
+    let timer, abort;
+    try {
+      const stopped = new Promise((_, reject) => {
+        abort = () => reject(new LaneFault('tcp-cancelled'));
+        signal.addEventListener('abort', abort, { once: true });
+        timer = setTimeout(() => reject(new LaneFault('tcp-connect-timeout')), timeout);
+        if (signal.aborted) abort();
+      });
+      await Promise.race([socket.opened, stopped]);
+      if (signal.aborted) throw new LaneFault('tcp-cancelled');
+      return new TCPPeer(socket);
+    } catch (error) {
+      closeTCP(socket);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+    }
+  };
+}
+
+function createUpstreamDial(tcpDial, kwsDial = dialKWS) {
+  const retryAt = new Float64Array(telegramTCP.length);
+  return async (info, signal) => {
+    const { dc, media } = info;
+    if (!Number.isInteger(dc) || dc < 1 || dc > telegramTCP.length || typeof media !== 'boolean') {
+      throw new LaneFault('obfuscation');
+    }
+    if (signal.aborted) throw new LaneFault('upstream-cancelled');
+    const index = dc - 1;
+    if (media) return kwsDial(info, signal);
+    const stats = tcpStats[index];
+    const started = Date.now();
+    if (retryAt[index] > started) {
+      increment(stats, 'cooldown');
+      return kwsDial(info, signal);
+    }
+    try {
+      const peer = await tcpDial(info, signal);
+      if (signal.aborted) {
+        safeClose(peer);
+        throw new LaneFault('upstream-cancelled');
+      }
+      increment(stats, 'connected');
+      const elapsed = Date.now() - started;
+      observeTiming(stats.timing, elapsed);
+      observeTiming(timings.tcp, elapsed);
+      peer.markUnresponsive = () => {
+        peer.markUnresponsive = null;
+        increment(stats, 'firstResponseFailures');
+        retryAt[index] = Date.now() + TCP_COOLDOWN_MS;
+      };
+      return peer;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      increment(stats, 'failed');
+      if (error instanceof LaneFault && error.kind === 'tcp-connect-timeout') increment(stats, 'timeout');
+      retryAt[index] = Date.now() + TCP_COOLDOWN_MS;
+      return kwsDial(info, signal);
+    }
+  };
+}
+
+const dialUpstream = createUpstreamDial(createTCPEngine(connect));
+export default createWorker();
+
 async function attemptKWS(host, attempt, fetcher, timeout, record) {
   const signal = attempt.signal;
   if (signal.aborted) return null;
@@ -895,8 +1048,7 @@ async function attemptKWS(host, attempt, fetcher, timeout, record) {
   const stopped = new Promise(resolve => { wake = () => resolve(null); });
   signal.addEventListener('abort', wake, { once: true });
   const timer = setTimeout(() => {
-    count('kws-handshake-timeout');
-    record?.(false);
+    record('timeout');
     attempt.abort();
   }, timeout);
   try {
@@ -913,19 +1065,15 @@ async function attemptKWS(host, attempt, fetcher, timeout, record) {
     if (signal.aborted || response.status !== 101 || !response.webSocket ||
         response.headers.get('Sec-WebSocket-Protocol') !== 'binary') {
       if (!signal.aborted) {
-        count(response.status === 101 ? 'kws-handshake-protocol' : 'kws-handshake-http');
-        record?.(false);
+        record(response.status === 101 ? 'protocol' : 'http');
       }
       releaseUpgrade(response);
       return null;
     }
-    record?.(true);
+    record(null);
     return response.webSocket;
   } catch {
-    if (!signal.aborted) {
-      count('kws-handshake-network');
-      record?.(false);
-    }
+    if (!signal.aborted) record('network');
     return null;
   } finally {
     clearTimeout(timer);
@@ -940,6 +1088,7 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
   if (signal.aborted) throw new LaneFault('kws-connect');
 
   const hosts = kwsHosts(info);
+  const stats = upstreamStats[dcIndex(info)];
   const order = router?.plan(info) ?? [0, 1];
   if (order[0] === 1) count('kws-cooldown-bypass');
   const attempts = [];
@@ -961,6 +1110,7 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
     start(0);
 
     function finish(winner, socket) {
+      if (done) return;
       done = true;
       clearTimeout(timer);
       signal.removeEventListener('abort', abort);
@@ -969,11 +1119,15 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
         if (i !== winner) attempt.abort();
       }
       if (!socket) {
+        increment(stats, signal.aborted ? 'cancelled' : 'failed');
         reject(new LaneFault('kws-connect'));
         return;
       }
       if (winner === 1) count('kws-backup-won');
-      observeTiming(timings.kws, Date.now() - started);
+      increment(stats, 'connected');
+      const elapsed = Date.now() - started;
+      observeTiming(timings.kws, elapsed);
+      observeTiming(stats.timing, elapsed);
       resolve(socket);
     }
 
@@ -981,6 +1135,7 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
       backupStarted = true;
       clearTimeout(timer);
       count('kws-retry');
+      increment(stats, 'retries');
       start(1);
     }
 
@@ -990,7 +1145,13 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
       attempts[index] = attempt;
       const candidate = order[index];
       const record = router?.start(info, candidate);
-      void attemptKWS(hosts[candidate], attempt, fetcher, timeout, record).then(socket => {
+      void attemptKWS(hosts[candidate], attempt, fetcher, timeout, reason => {
+        if (reason) {
+          count('kws-handshake-' + reason);
+          increment(stats, reason);
+        }
+        record?.(!reason);
+      }).then(socket => {
         pending--;
         if (done) {
           if (socket) releaseSocket(socket);
@@ -1021,10 +1182,17 @@ function pause(ms, signal) {
   });
 }
 
-// workerd versions without bufferedAmount still have application receive
-// budgets. On versions with the property, stop feeding the native send queue.
+function nativeBufferedAmount(socket) {
+  try {
+    const amount = socket?.bufferedAmount;
+    return Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function congested(socket, length) {
-  return socket.bufferedAmount > SOCKET_BUFFER - Math.min(length, SOCKET_BUFFER);
+  return (nativeBufferedAmount(socket) ?? 0) > SOCKET_BUFFER - Math.min(length, SOCKET_BUFFER);
 }
 
 class Lane {
@@ -1038,6 +1206,7 @@ class Lane {
   head = new Uint8Array(64);
   headSize = 0;
   peer = null;
+  peerEnded = false;
   packets = null;
   upBusy = false;
   downBusy = false;
@@ -1046,7 +1215,9 @@ class Lane {
   expiryTimer = null;
   packetTimer = null;
   nativeTimer = null;
+  peerDrainTimer = null;
   nativeBytes = [0, 0];
+  nativeProgressAt = [0, 0];
 
   constructor(socket, sid, secret, group, dial = connectKWS, options = {}) {
     this.socket = socket;
@@ -1054,7 +1225,6 @@ class Lane {
     this.secret = secret;
     this.group = group;
     this.dial = dial;
-    this.directTCP = options.directTCP === true;
     this.budget = laneBudget(group);
     this.release = options.release ?? (() => { group.active--; });
     this.openMs = options.openMs ?? 12000;
@@ -1066,8 +1236,8 @@ class Lane {
     this.onMessage = event => this.receive(event.data);
     this.onClose = () => this.stop('normal', false);
     this.onError = () => this.stop('client-socket', false);
-    this.onDown = event => this.enqueueDown(event.data);
-    this.onPeerClose = () => this.stop('kws-close');
+    this.onDown = event => { void this.enqueueDown(event.data); };
+    this.onPeerClose = event => this.closeFromPeer(event.code);
     this.onPeerError = () => this.stop('kws-socket');
   }
 
@@ -1098,7 +1268,20 @@ class Lane {
   }
 
   fault(error) {
-    this.stop(error instanceof LaneFault ? error.kind : 'internal');
+    const kind = error instanceof LaneFault ? error.kind : 'internal';
+    // A concurrent upload can encounter the closed peer while its final
+    // downlink bytes are still being forwarded.
+    if (kind !== 'kws-socket' || !this.peerEnded) this.stop(kind);
+  }
+
+  closeFromPeer(code) {
+    if (this.ended || this.peerEnded) return;
+    if (code !== 1000 || !this.downBusy) {
+      this.stop('kws-close');
+      return;
+    }
+    this.peerEnded = true;
+    this.peerDrainTimer = setTimeout(() => this.stop('kws-close'), this.stallMs);
   }
 
   receive(value) {
@@ -1115,6 +1298,7 @@ class Lane {
         } else if (this.phase === 'waiting') {
           throw new LaneFault('frame');
         } else if (type === DATA && length) {
+          if (this.peerEnded) return;
           if (length > this.receiving || this.upItems >= 1024) throw new LaneFault('queue');
           const first = !retention;
           this.budget.hold(256 + (first ? bytes.length : 0));
@@ -1134,7 +1318,7 @@ class Lane {
           throw new LaneFault('frame');
         }
       });
-      if (!this.upBusy && !this.ended && this.up.length) void this.pumpUp();
+      if (!this.upBusy && !this.ended && !this.peerEnded && this.up.length) void this.pumpUp();
     } catch (error) {
       this.fault(error);
     }
@@ -1152,10 +1336,15 @@ class Lane {
 
   async drain(socket, length) {
     const deadline = Date.now() + this.stallMs;
-    while (congested(socket, length)) {
+    const threshold = SOCKET_BUFFER - Math.min(length, SOCKET_BUFFER);
+    let delay = 8, previous = Infinity;
+    for (let amount; (amount = nativeBufferedAmount(socket) ?? 0) > threshold;) {
       this.assertSocket(socket);
-      if (Date.now() >= deadline) throw new LaneFault('socket-backpressure');
-      await pause(8, this.controller.signal);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new LaneFault('socket-backpressure');
+      delay = amount < previous ? 8 : Math.min(delay * 2, 32);
+      previous = amount;
+      await pause(Math.min(delay, remaining), this.controller.signal);
     }
     this.assertSocket(socket);
   }
@@ -1165,18 +1354,14 @@ class Lane {
     const clientRead = await obfuscationCipher(header, this.secret);
     const info = readHead(await clientRead(header));
     this.assertLive();
-    const head = makeHead(info, this.directTCP);
+    const head = makeHead(info);
     const dialing = Promise.resolve(this.dial(info, this.controller.signal));
     let peer, prepared;
     const prepare = Promise.all([
       obfuscationCipher(header, this.secret, true),
       obfuscationCipher(head, EMPTY),
       obfuscationCipher(head, EMPTY, true),
-    ]).then(async ([clientWrite, peerWrite, peerRead]) => {
-      const wire = await peerWrite(head);
-      wire.set(head.subarray(0, 56));
-      return { clientWrite, peerWrite, peerRead, wire };
-    });
+    ]);
     try {
       [prepared, peer] = await Promise.all([prepare, dialing]);
       this.assertLive();
@@ -1185,8 +1370,15 @@ class Lane {
       void dialing.then(releaseSocket, () => {});
       throw error;
     }
-    const { clientWrite, peerWrite, peerRead, wire } = prepared;
+    const [clientWrite, peerWrite, peerRead] = prepared;
     this.peer = peer;
+    this.directTCP = peer instanceof TCPPeer;
+    // The tail is encrypted. It can be set after key preparation because
+    // the two CTR keys and counters only use bytes 8 through 55.
+    if (this.directTCP) view(head).setInt16(60, 0, true);
+    const wire = await peerWrite(head);
+    this.assertLive();
+    wire.set(head.subarray(0, 56));
     this.clientRead = clientRead;
     this.clientWrite = clientWrite;
     this.peerRead = peerRead;
@@ -1216,6 +1408,7 @@ class Lane {
       await peer.write(bytes);
       this.assertLive();
     } catch {
+      if (!this.ended && !this.firstUpstream) peer.markUnresponsive?.();
       throw new LaneFault('tcp-write');
     } finally {
       clearTimeout(timer);
@@ -1237,6 +1430,7 @@ class Lane {
           const { done, value } = await peer.read(size);
           this.assertLive();
           if (done) {
+            if (!this.firstUpstream) peer.markUnresponsive?.();
             this.stop('tcp-close');
             return;
           }
@@ -1250,6 +1444,7 @@ class Lane {
         }
       }
     } catch (error) {
+      if (!(error instanceof LaneFault) && !this.ended && !this.firstUpstream) peer.markUnresponsive?.();
       this.fault(error instanceof LaneFault ? error : new LaneFault('tcp-read'));
     }
   }
@@ -1349,7 +1544,7 @@ class Lane {
   async pumpUp() {
     this.upBusy = true;
     try {
-      while (!this.ended && this.up.length) {
+      while (!this.ended && !this.peerEnded && this.up.length) {
         let item = this.up.take();
         let raw = item.data, copy = 0;
         const length = raw.length + this.up.prefixBytes(packLimit(raw.length) - raw.length);
@@ -1398,7 +1593,7 @@ class Lane {
   }
 
   enqueueDown(value) {
-    if (this.ended) return;
+    if (this.ended || this.peerEnded) return;
     try {
       this.assertLive();
       const data = binary(value);
@@ -1484,12 +1679,12 @@ class Lane {
                 }
               }
               this.assertLive();
-              const wire = await this.clientWrite(plain);
+              const wire = await this.clientWrite(plain, true);
               for (let pos = 0; pos < wire.length;) {
                 this.assertSocket(this.socket);
                 const remaining = wire.length - pos;
                 const minimum = Math.min(remaining, DOWN_FRAME) + 8;
-                const available = SOCKET_BUFFER - this.socket.bufferedAmount;
+                const available = SOCKET_BUFFER - (nativeBufferedAmount(this.socket) ?? 0);
                 if (available < minimum) {
                   const started = Date.now();
                   try { await this.drain(this.socket, minimum); }
@@ -1525,6 +1720,7 @@ class Lane {
       this.fault(error);
     } finally {
       this.downBusy = false;
+      if (this.peerEnded) this.stop('kws-close');
     }
   }
 
@@ -1538,41 +1734,59 @@ class Lane {
     this.writeNative(this.socket, bytes);
   }
 
-  reconcileNative(socket, side) {
+  reconcileNative(socket, side, queued = nativeBufferedAmount(socket)) {
     const before = this.nativeBytes[side];
     if (!before) return;
-    const queued = socket?.bufferedAmount;
-    if (queued >= 0 && queued < before) {
+    if (queued === undefined) {
+      // This socket previously exposed a nonempty native queue. Its bytes
+      // cannot safely be treated as drained when the reading disappears.
+      this.stop('socket-buffer-unavailable');
+    } else if (queued < before) {
       this.nativeBytes[side] = queued;
+      if (queued) this.nativeProgressAt[side] = Date.now();
       this.budget.release(before - queued);
     }
   }
 
   scheduleNativeCheck(delay = 30) {
     if (this.nativeTimer !== null || !(this.nativeBytes[0] || this.nativeBytes[1])) return;
+    const [clientBytes, peerBytes] = this.nativeBytes;
+    const deadline = Math.min(
+      clientBytes ? this.nativeProgressAt[0] + this.stallMs : Infinity,
+      peerBytes ? this.nativeProgressAt[1] + this.stallMs : Infinity,
+    );
     this.nativeTimer = setTimeout(() => {
       this.nativeTimer = null;
       if (this.ended) return;
       const before = this.nativeBytes[0] + this.nativeBytes[1];
-      this.reconcileNative(this.socket, 0);
-      this.reconcileNative(this.peer, 1);
+      if (this.nativeBytes[0]) this.reconcileNative(this.socket, 0);
+      if (this.nativeBytes[1]) this.reconcileNative(this.peer, 1);
+      const time = Date.now();
+      if (this.nativeBytes.some((bytes, side) => bytes && time - this.nativeProgressAt[side] >= this.stallMs)) {
+        this.stop('socket-buffer-stall');
+        return;
+      }
       // Bound the polling cost while the native queue makes no progress.
       const drained = this.nativeBytes[0] + this.nativeBytes[1] < before;
       this.scheduleNativeCheck(drained ? 30 : Math.min(delay * 2, 250));
-    }, delay);
+    }, Math.min(delay, Math.max(0, deadline - Date.now())));
   }
 
   writeNative(socket, payload) {
-    if (typeof socket.bufferedAmount !== 'number') {
+    const side = socket === this.socket ? 0 : 1;
+    const queued = nativeBufferedAmount(socket);
+    if (queued === undefined) {
+      if (this.nativeBytes[side]) throw new LaneFault('socket-buffer-unavailable');
       socket.send(payload);
       return;
     }
-    const side = socket === this.socket ? 0 : 1;
-    this.reconcileNative(socket, side);
+    this.reconcileNative(socket, side, queued);
     this.budget.hold(payload.byteLength);
+    const wasEmpty = this.nativeBytes[side] === 0;
     this.nativeBytes[side] += payload.byteLength;
     socket.send(payload);
     this.reconcileNative(socket, side);
+    if (wasEmpty && this.nativeBytes[side]) this.nativeProgressAt[side] = Date.now();
     this.scheduleNativeCheck();
   }
 
@@ -1584,7 +1798,9 @@ class Lane {
     clearTimeout(this.expiryTimer);
     clearTimeout(this.packetTimer);
     clearTimeout(this.nativeTimer);
+    clearTimeout(this.peerDrainTimer);
     this.openTimer = this.expiryTimer = this.packetTimer = this.nativeTimer = null;
+    this.peerDrainTimer = null;
     this.budget.release(this.nativeBytes[0] + this.nativeBytes[1]);
     this.nativeBytes.fill(0);
     this.controller.abort();
@@ -1806,15 +2022,26 @@ function runBridge(origin, fast, bootstrap) {
     return renewal;
   }
 
+  function socketBuffer(socket) {
+    try {
+      const amount = socket?.bufferedAmount;
+      return Number.isSafeInteger(amount) && amount >= 0 ? amount : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   function flush(lane) {
     const ws = lane.socket;
     if (closed || lane.done || ws?.readyState !== WebSocket.OPEN || lane.timer) return;
+    let progressed = false;
     for (let sends = 0; lane.head < lane.queue.length && sends < 64; sends++) {
       const first = lane.queue[lane.head];
-      if (ws.bufferedAmount > 2097152 - first.byteLength) break;
+      const buffered = socketBuffer(ws);
+      if (buffered > 2097152 - first.byteLength) break;
       let length = first.byteLength, last = lane.head + 1;
       while (last < lane.queue.length && length + lane.queue[last].byteLength <= 32768 &&
-             ws.bufferedAmount + length + lane.queue[last].byteLength <= 2097152) {
+             buffered + length + lane.queue[last].byteLength <= 2097152) {
         length += lane.queue[last++].byteLength;
       }
       let data = first;
@@ -1828,6 +2055,7 @@ function runBridge(origin, fast, bootstrap) {
         data = joined.buffer;
       }
       ws.send(data);
+      progressed = true;
       pendingItems -= last - lane.head;
       pendingBytes -= length;
       lane.bytes -= length;
@@ -1836,23 +2064,25 @@ function runBridge(origin, fast, bootstrap) {
     }
     if (lane.head === lane.queue.length) {
       lane.queue.length = lane.head = 0;
-      lane.stalled = 0;
+      lane.stalled = lane.stallDelay = undefined;
       return;
     }
     if (lane.head >= 128 && lane.head * 2 >= lane.queue.length) {
       lane.queue.splice(0, lane.head);
       lane.head = 0;
     }
-    const blocked = ws.bufferedAmount > 2097152 - lane.queue[lane.head].byteLength;
-    lane.stalled = blocked ? lane.stalled || performance.now() : 0;
-    if (lane.stalled && performance.now() - lane.stalled > 30000) {
+    const blocked = socketBuffer(ws) > 2097152 - lane.queue[lane.head].byteLength;
+    const stalled = blocked && !progressed ? lane.stalled : undefined;
+    lane.stalled = blocked ? stalled ?? performance.now() : undefined;
+    if (blocked && performance.now() - lane.stalled >= 30000) {
       finish(lane, true);
       return;
     }
+    lane.stallDelay = blocked ? Math.min(80, (stalled === undefined ? 5 : lane.stallDelay) * 2) : 0;
     lane.timer = setTimeout(() => {
       lane.timer = 0;
       try { flush(lane); } catch { finish(lane, true); }
-    }, blocked ? 10 : 0);
+    }, lane.stallDelay);
   }
 
   async function openLane(lane) {
@@ -1917,7 +2147,7 @@ function runBridge(origin, fast, bootstrap) {
   function enqueue(buffer) {
     let buffered = 0;
     const touched = new Set();
-    for (const lane of lanes.values()) buffered += lane.socket?.bufferedAmount ?? 0;
+    for (const lane of lanes.values()) buffered += socketBuffer(lane.socket);
     eachFrame(buffer, (type, id, length, start, end, view) => {
       if (closed) return;
       if (!id) throw Error();
@@ -1935,7 +2165,7 @@ function runBridge(origin, fast, bootstrap) {
       if (!lane) return; // Late DATA or WINDOW for a lane that has closed.
       const size = end - start;
       if (pendingBytes + buffered + size > 33554432 || pendingItems >= 16384 ||
-          lane.bytes + (lane.socket?.bufferedAmount ?? 0) + size > 8388608 ||
+          lane.bytes + socketBuffer(lane.socket) + size > 8388608 ||
           lane.queue.length - lane.head >= 1024) {
         finish(lane, true);
         return;
@@ -2184,6 +2414,33 @@ ${diagnostics ? `document.getElementById('probe').addEventListener('click', asyn
     permissions + ', clipboard-read=(), clipboard-write=(self)', { form: true });
 }
 
+function upstreamSummary() {
+  let rows = '';
+  for (const [index, stats] of upstreamStats.entries()) {
+    const finished = stats.connected + stats.failed;
+    if (!finished && !stats.cancelled && !stats.retries) continue;
+    const rate = finished ? Math.round(stats.connected * 100 / finished) + '%' : '暂无';
+    rows += '<dt>DC ' + (Math.floor(index / 2) + 1) + (index % 2 ? ' · 媒体' : ' · 通用') + '</dt><dd>' +
+      '成功 ' + stats.connected + ' / ' + finished + '（' + rate + '），取消 ' + stats.cancelled +
+      '，备用尝试 ' + stats.retries + '<br>' + timingSummary(stats.timing) +
+      '<br>拨号错误：超时 ' + stats.timeout + '，网络 ' + stats.network +
+      '，HTTP ' + stats.http + '，协议 ' + stats.protocol + '</dd>';
+  }
+  return rows ? '<dl>' + rows + '</dl>' : '<p>暂无 KWS 拨号样本。</p>';
+}
+
+function tcpSummary() {
+  let rows = '';
+  for (const [index, stats] of tcpStats.entries()) {
+    const finished = stats.connected + stats.failed;
+    if (!finished && !stats.cooldown) continue;
+    rows += '<dt>DC ' + (index + 1) + '</dt><dd>建连 ' + stats.connected + ' / ' + finished +
+      '，超时 ' + stats.timeout + '，冷却回退 ' + stats.cooldown +
+      '，首次响应前断开 ' + stats.firstResponseFailures + '<br>' + timingSummary(stats.timing) + '</dd>';
+  }
+  return rows ? '<dl>' + rows + '</dl>' : '<p>暂无 TCP 拨号样本。</p>';
+}
+
 function portalDiagnostics(request) {
   const colo = request.cf?.colo ?? '';
   const incoming = /^[A-Z]{3}$/.test(colo) ? colo : '未提供';
@@ -2194,22 +2451,25 @@ function portalDiagnostics(request) {
     '<p>机房和 RTT 来自本次管理页请求的 Cloudflare 元数据，反映该请求的接入位置与往返耗时。</p><dl>' +
     '<dt>接入机房（colo）</dt><dd>' + incoming + '</dd>' +
     '<dt>客户端到 Cloudflare RTT</dt><dd>' + pageRtt + '</dd></dl>' +
-    '<p>以下采样来自本实例已接受或建连成功的代理连接。P95 按区间显示。</p><dl>' +
+    '<p>分别统计 Bridge 签发、客户端 WebSocket 升级、TCP 建连、KWS 握手和首批数据。P95 按区间显示。</p><dl>' +
     '<dt>Bridge 配置与密钥准备</dt><dd>' + timingSummary(timings.bridgeConfig) + '</dd>' +
-    '<dt>Worker 处理 Bridge 页面</dt><dd>' + timingSummary(timings.bridgePage) + '</dd>' +
+    '<dt>成功签发 Bridge 页面</dt><dd>' + timingSummary(timings.bridgePage) + '</dd>' +
     '<dt>代理升级请求的入口 RTT</dt><dd>' + timingSummary(timings.client) + '</dd>' +
-    '<dt>Worker 处理 WebSocket 升级</dt><dd>' + timingSummary(timings.upgrade) + '</dd>' +
-    '<dt>Worker 到 KWS 建连</dt><dd>' + timingSummary(timings.kws) + '</dd>' +
+    '<dt>客户端 WebSocket 升级成功</dt><dd>' + timingSummary(timings.upgrade) + '</dd>' +
+    '<dt>Telegram TCP 建连成功</dt><dd>' + timingSummary(timings.tcp) + '</dd>' +
+    '<dt>Telegram KWS 握手成功</dt><dd>' + timingSummary(timings.kws) + '</dd>' +
     '<dt>升级后收到首批上游数据</dt><dd>' + timingSummary(timings.firstUpstream) + '</dd>' +
     '<dt>升级后转发首批数据</dt><dd>' + timingSummary(timings.firstForwarded) + '</dd>' +
     '<dt>等待客户端接收额度</dt><dd>' + timingSummary(timings.downCredit) + '</dd>' +
     '<dt>等待 WebSocket 发送缓冲</dt><dd>' + timingSummary(timings.downSocket) + '</dd>' +
     '<dt>上游接收 / 已转发</dt><dd>' + upstreamBytes + ' / ' + forwardedBytes + ' 字节</dd></dl>' +
+    '<h2>普通 DC · TCP</h2>' + tcpSummary() +
+    '<h2>Telegram KWS</h2><p>成功率按已完成的 KWS 拨号计算。取消单列，失败原因按实际尝试计数。</p>' + upstreamSummary() +
     '<p>计数仅覆盖处理本次页面请求的实例，实例重启时清零。</p><dl>' +
     Object.entries(counters).sort(([a], [b]) => a.localeCompare(b))
       .map(([kind, value]) => '<dt>' + kind + '</dt><dd>' + value + '</dd>').join('') +
-    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用记账缓冲字节数</dt><dd>' + queuedBytes + '</dd></dl>' +
-    '<p>缓冲字节数为应用记账，实例总内存由 Cloudflare 运行时统计。</p></details>';
+    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用缓冲当前 / 峰值</dt><dd>' + queuedBytes + ' / ' + peakQueuedBytes + ' 字节</dd></dl>' +
+    '<p>应用缓冲基于代码记账，运行时原生缓冲仅在接口提供读数时可见。</p></details>';
 }
 
 function publicHomeResponse(method) {
@@ -2261,6 +2521,6 @@ function publicPage(method, title, content, form = false, status = 200) {
 }
 
 export {
-  advanceCounter, configuration, connectKWS, createCTR, createWorker, encodeFrame, issueToken,
+  advanceCounter, configuration, connectKWS, createCTR, createTCPEngine, createUpstreamDial, createWorker, encodeFrame, issueToken,
   Lane, makeHead, packetSize, readHead, UpstreamRouter, verifyBridge, verifyToken, visitFrames,
 };
