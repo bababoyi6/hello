@@ -27,6 +27,7 @@ KWS 需另外证明 `binary` 子协议、各 transport mode、媒体 DC 和断�
 | --- | --- | --- |
 | 高 | `Lane.enqueueDown`、`pumpDown` 和上游关闭 | KWS 以 `1000` 关闭时，在仍有下行数据的情况下，按额度发送已接收的数据，再关闭 Lane。异常断开、撤销和过期即时收尾。尾包等待有期限，关闭后停止接收新上传数据。测试覆盖尾包顺序、阻塞期限、并行 Lane 继续工作和预算归零。 |
 | 高 | `writeNative`、`reconcileNative`、`drain`、Bridge 发送队列 | 检查读数为非负安全整数，并处理读取抛错。原生读数从连接开始即不可用时使用应用层额度和上限。已经记账的原生队列失去读数时关闭该 Lane。发送有进展时及时继续，无进展时降低轮询频率。测试覆盖缺失值、`NaN`、慢客户端、时间上限和定时器取消。 |
+| 高 | `scheduleNativeCheck` 与半开连接 | 只要原生发送队列仍有已记账数据，就分别记录客户端和上游的进展。即使队列小于拥塞阈值，一侧持续 30 秒无进展也会释放 Lane 和缓冲。另一侧有进展不会掩盖该停滞。空队列停止轮询，正常空闲连接保持在线。 |
 | 高 | `PacketAssembly.add` | 原先收到声明最大长度的四字节头即预分配约 8 MiB。现在按已收字节增长，四字节头占用 64 KiB 分配；扩容期间两个缓冲都计账。正常的大分片上传会产生额外的增长复制，见实测。每条 KWS 上传消息仍是完整的 transport 包。 |
 | 高 | `routePortal`、`configuration` | 提前拒绝超限的 `Content-Length`，上限为 1024 字节。拒绝不合理的 Cookie 有效期，异步验签后重新检查过期。保持密码、代理密钥和票据编码兼容。 |
 | 中 | `createCTR`、`pumpDown` | 减少非对齐下载中的 JS 中间复制，保留 WebCrypto AES-CTR、块内尾部和 128 位进位检查。同步推入 KWS 事件回调，使 workerd 的事件处理无需接收一个未使用的 Promise。 |
@@ -45,7 +46,7 @@ KWS 需另外证明 `binary` 子协议、各 transport mode、媒体 DC 和断�
 
 ## 验证与复现
 
-基线通过 81 项 Node 测试和 8 项本地 workerd 测试。改版通过 97 项 Node 测试和 9 项本地 workerd 测试。用例覆盖标准 AES-CTR 测试向量、任意分片和计数器进位，载体与 MTProto 帧、损坏输入、鉴权和原代理密钥向量，双向传输、最大包、并行 Lane、回压与预算、主备、迟到响应、超时、过期以及清理。workerd 验证的是本机真实 WebSocket 运行时与模拟 KWS 上游，包含只提供 `p` 的打包文件，以及客户端或上游先关闭的场景。CI 使用固定依赖并验证离线批量传输的完整性。
+基线通过 81 项 Node 测试和 8 项本地 workerd 测试。改版通过 99 项 Node 测试和 10 项本地 workerd 测试。用例覆盖标准 AES-CTR 测试向量、任意分片和计数器进位，载体与 MTProto 帧、损坏输入、鉴权和原代理密钥向量，双向传输、最大包、并行 Lane、回压与预算、主备、迟到响应、超时、过期以及清理。workerd 验证包含只提供 `p` 的打包文件、模拟 KWS 与原生 WebSocket、客户端或上游先关闭，以及原生 TCP 回环连接上的分片双向传输和 EOF。CI 使用固定依赖，并验证两条传输路径的批量数据完整性。
 
 ```sh
 npm ci
@@ -80,6 +81,32 @@ node benchmarks/startup.mjs --against=cc6854dac1e368c9ad1b3467bcc7cee276c893c7
 
 建连计时从 Bridge 请求开始。两版正常快速路径的额外 session POST 都是 0，成功 KWS 拨号为 1 次，主路人为失败时是 2 次。新实例同时签发 8 个 Bridge 的 P95 为 4.809 → 6.262 ms，均只调用一次 PBKDF2；进程 CPU P95 均为 16 ms。超时、竞速取消和慢队列恢复另用可控时钟验证，表格不包含真实线路延迟。
 
+### TCP 与 KWS 专项对照
+
+这两条上游都保留独立的传输密钥。TCP 开销主要来自 `ReadableStream` 的 BYOB 读、`WritableStream` 写和调度，KWS 则由完整 WebSocket 消息驱动及合包。TCP 链路只使用当前已核对的普通 DC 引导地址。生产媒体路由还需区分数据中心的 `media_only`、端口和密钥等参数。TCP 直连的上游没有外层 TLS，KWS 则由 TLS 提供外层链路保护。 [Cloudflare TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) · [Telegram transport](https://core.telegram.org/mtproto/transports) · [Telegram DC 配置](https://core.telegram.org/api/datacenter)
+
+本地整组对照使用 `a6310c1` 的两条路径、相同的 Node 模拟载体和 7 轮交错计时。KWS 和 TCP 中位数如下，所谓媒体大小指负载规模，TCP 测试使用普通 DC。运行 `node --expose-gc benchmarks/transport.mjs --sizes --tcp` 可复现。
+
+| 模拟负载 | KWS / TCP 吞吐（MiB/s） | KWS / TCP 批次 P95（ms） |
+| --- | ---: | ---: |
+| 交互小包 | 1.38 / 0.91 | 0.134 / 0.190 |
+| 交互与媒体大小混合包 | 311.29 / 217.18 | 2.153 / 2.803 |
+| 16 KiB 下载 | 248.37 / 352.05 | 0.76 / 0.51 |
+| 持续下载 | 841.74 / 741.93 | 1.76 / 2.99 |
+| 1 MiB 包下载 | 1,191.12 / 776.60 | 2.96 / 4.38 |
+| 慢客户端持续下载 | 7.97 / 7.99 | 125.19 / 124.90 |
+
+补测用随机 nonce 发出标准未认证握手，并只接受 nonce 匹配的 `resPQ`。本机公网两轮从开始连接到收到响应，普通 TCP 为 907–2,287 ms、普通 KWS 为 1,942–3,446 ms、媒体 KWS 为 1,859–4,255 ms，三类各 6 次均成功。首轮试测另有两个 KWS 响应超出 3 秒，正式对照统一使用 6 秒。匿名 Cloudflare Playground 中，探针同样验证响应，预览请求的 `colo` 为 **ORD（芝加哥）**。每格为拨号开始至经过校验的响应时间。
+
+| ORD 样本 | 普通 TCP（ms） | 普通 KWS（ms） | 媒体 KWS（ms） |
+| --- | ---: | ---: | ---: |
+| DC 1 | 72 | 189 | 208 |
+| DC 2，第 1 次 | 291 | 921 | 1,105 |
+| DC 2，第 2 次 | 285 | 740 | 829 |
+| DC 5 | 443 | 1,270 | 1,297 |
+
+**生产继续使用 KWS。** TCP 在实测路径上的普通 DC 初始响应更快，KWS 在多数本地传输负载中有更好的吞吐和批次 P95。ORD 的四个样本没有覆盖亚洲边缘、长期会话或登录后媒体传输，目前也缺少 TCP 媒体和主备路由同等覆盖。TCP 实验留在自动化测试与基准里。生产入口不加额外拨号、定时探测或传输切换。 [Telegram 初始握手](https://core.telegram.org/mtproto/samples-auth_key) · [Cloudflare Workers Playground](https://developers.cloudflare.com/workers/playground/)
+
 ### 实机验收范围
 
-本次使用本机模拟并且没有访问用户的 Cloudflare 账户。Cloudflare 边缘实际 CPU、内存、RTT、路由、长期后台在线、Wi-Fi/移动网络切换后的重建，以及 Windows、iOS、Android 的真实 Telegram 客户端，均未验证。协议向量和 Bridge MessagePort 测试覆盖可复现的客户端接口，生产网络质量和客户端完整行为仍须以真实会话为准。
+本机及匿名 Playground 测试未访问用户的 Cloudflare 账户和域名。Playground 只运行无凭据的合成握手。生产 Worker 的边缘 CPU、内存、亚洲入口与实际回源线路、长期后台在线、Wi-Fi/移动网络切换后的重建，以及 Windows、iOS、Android 的真实 Telegram 客户端，均未验证。协议向量和 Bridge MessagePort 测试覆盖可复现的客户端接口，生产网络质量和客户端完整行为仍须以真实会话为准。

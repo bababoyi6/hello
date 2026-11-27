@@ -34,4 +34,4 @@ jobs:
       - run: npm test
       - run: npm run test:runtime
       - name: Verify bulk and concurrent transfers
-        run: node --expose-gc benchmarks/transport.mjs --quick --sizes --verify
+        run: node --expose-gc benchmarks/transport.mjs --quick --sizes --verify --tcp

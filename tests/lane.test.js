@@ -489,6 +489,59 @@ it.each([undefined, NaN, Infinity, -1])('keeps application flow control with an 
   }
 });
 
+it('reclaims a small native queue when only the other direction makes progress', async () => {
+  vi.useFakeTimers();
+  const peer = new FakeSocket();
+  peer.accept();
+  const { lane, group, client } = laneOf(1, transportFixture(), async () => peer, { stallMs: 1000 });
+  lane.peer = peer;
+  const queueSends = socket => {
+    const send = socket.send.bind(socket);
+    socket.send = bytes => { send(bytes); socket.bufferedAmount += bytes.length; };
+  };
+  queueSends(client);
+  queueSends(peer);
+  try {
+    lane.writeNative(client, new Uint8Array(12));
+    lane.writeNative(peer, new Uint8Array(64));
+    await vi.advanceTimersByTimeAsync(400);
+    peer.bufferedAmount = 40;
+    await vi.advanceTimersByTimeAsync(599);
+    expect(lane.ended).toBe(false);
+    expect(group.bytes).toBe(52);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(lane.ended).toBe(true);
+    expect(group.bytes).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    client.close();
+    vi.useRealTimers();
+  }
+});
+
+it('extends a queued socket deadline on partial writes and leaves a drained lane open', async () => {
+  vi.useFakeTimers();
+  const { lane, group, client } = laneOf(1, transportFixture(), async () => new FakeSocket(), { stallMs: 1000 });
+  const send = client.send.bind(client);
+  client.send = bytes => { send(bytes); client.bufferedAmount += bytes.length; };
+  try {
+    lane.writeNative(client, new Uint8Array(12));
+    await vi.advanceTimersByTimeAsync(500);
+    client.bufferedAmount = 6;
+    await vi.advanceTimersByTimeAsync(700);
+    expect(lane.ended).toBe(false);
+    expect(group.bytes).toBe(6);
+    client.bufferedAmount = 0;
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(group.bytes).toBe(0);
+    expect(lane.nativeTimer).toBeNull();
+    expect(lane.ended).toBe(false);
+  } finally {
+    client.close();
+    vi.useRealTimers();
+  }
+});
+
 it('closes an accounted socket whose native buffer reading becomes invalid', async () => {
   vi.useFakeTimers();
   const { lane, group, client } = laneOf(1, transportFixture(), async () => new FakeSocket());

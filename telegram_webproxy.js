@@ -1101,6 +1101,7 @@ class Lane {
   nativeTimer = null;
   peerDrainTimer = null;
   nativeBytes = [0, 0];
+  nativeProgressAt = [0, 0];
 
   constructor(socket, sid, secret, group, dial = connectKWS, options = {}) {
     this.socket = socket;
@@ -1621,22 +1622,33 @@ class Lane {
       this.stop('socket-buffer-unavailable');
     } else if (queued < before) {
       this.nativeBytes[side] = queued;
+      if (queued) this.nativeProgressAt[side] = Date.now();
       this.budget.release(before - queued);
     }
   }
 
   scheduleNativeCheck(delay = 30) {
     if (this.nativeTimer !== null || !(this.nativeBytes[0] || this.nativeBytes[1])) return;
+    const [clientBytes, peerBytes] = this.nativeBytes;
+    const deadline = Math.min(
+      clientBytes ? this.nativeProgressAt[0] + this.stallMs : Infinity,
+      peerBytes ? this.nativeProgressAt[1] + this.stallMs : Infinity,
+    );
     this.nativeTimer = setTimeout(() => {
       this.nativeTimer = null;
       if (this.ended) return;
       const before = this.nativeBytes[0] + this.nativeBytes[1];
       if (this.nativeBytes[0]) this.reconcileNative(this.socket, 0);
       if (this.nativeBytes[1]) this.reconcileNative(this.peer, 1);
+      const time = Date.now();
+      if (this.nativeBytes.some((bytes, side) => bytes && time - this.nativeProgressAt[side] >= this.stallMs)) {
+        this.stop('socket-buffer-stall');
+        return;
+      }
       // Bound the polling cost while the native queue makes no progress.
       const drained = this.nativeBytes[0] + this.nativeBytes[1] < before;
       this.scheduleNativeCheck(drained ? 30 : Math.min(delay * 2, 250));
-    }, delay);
+    }, Math.min(delay, Math.max(0, deadline - Date.now())));
   }
 
   writeNative(socket, payload) {
@@ -1649,9 +1661,11 @@ class Lane {
     }
     this.reconcileNative(socket, side, queued);
     this.budget.hold(payload.byteLength);
+    const wasEmpty = this.nativeBytes[side] === 0;
     this.nativeBytes[side] += payload.byteLength;
     socket.send(payload);
     this.reconcileNative(socket, side);
+    if (wasEmpty && this.nativeBytes[side]) this.nativeProgressAt[side] = Date.now();
     this.scheduleNativeCheck();
   }
 
