@@ -1,0 +1,37 @@
+name: Worker regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: node --check telegram_webproxy.js
+      - run: npm test
+      - run: npm run test:runtime
+      - name: Verify bulk and concurrent transfers
+        run: node --expose-gc benchmarks/transport.mjs --quick --sizes --verify
